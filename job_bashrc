@@ -1,0 +1,19 @@
+#!bin/bash
+
+export HOME="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+export YOLO="${HOME}/YOLO"
+export SCRIPTS="${HOME}/scripts"
+export IMAGES="${HOME}/images"
+export IMAGES_JPG="${HOME}/YOLO/images_jpg"
+
+alias root="cd ${HOME}"
+alias yolo="cd ${YOLO}"
+
+
+export SV_INTERVAL_SEC=30
+export SV_CAM_SRC=0               # or an RTSP URL later
+export SV_WEIGHTS="yolov8n.pt"    # start tiny on CPU; bump later if you can
+export SV_IMG_SIZE=512
+export SV_CONF=0.35
+export SV_IOU=0.5
+export SV_SAVE_JPGS=1

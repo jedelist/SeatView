@@ -1,0 +1,6 @@
+# Model Weights
+*.pt
+
+# Images 
+*.jpg
+*.HEIC
