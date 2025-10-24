@@ -11,9 +11,10 @@ alias yolo="cd ${YOLO}"
 
 
 export SV_INTERVAL_SEC=30
-export SV_CAM_SRC=0               # or an RTSP URL later
+#export SV_CAM_SRC=0               # or an RTSP URL later
 export SV_WEIGHTS="yolov8n.pt"    # start tiny on CPU; bump later if you can
 export SV_IMG_SIZE=512
 export SV_CONF=0.35
 export SV_IOU=0.5
 export SV_SAVE_JPGS=1
+export SV_CAM_SRC=/dev/video1

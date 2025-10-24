@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 from ultralytics import YOLO
 import torch
+import subprocess, shlex, numpy as np
 
 # ---------- config (env variables overrides) ----------
 INTERVAL_SEC = int(os.getenv("SV_INTERVAL_SEC", "30"))
@@ -36,6 +37,40 @@ signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
 # ---------- helpers ----------
+
+def open_camera_from_env():
+    src_env = os.getenv("SV_CAM_SRC", "/dev/video1")  # default for your board
+    # Use CAP_V4L2 for numeric indices, CAP_ANY for device paths to avoid
+    # "backend can't be used to capture by name" warnings.
+    if src_env.isdigit():
+        cap = cv2.VideoCapture(int(src_env), cv2.CAP_V4L2)
+    else:
+        cap = cv2.VideoCapture(src_env, cv2.CAP_ANY)
+
+    # Hint the camera to MJPEG 1280x720 @ low FPS to save CPU
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 5)
+
+    # Warm-up reads (some cams need a couple)
+    if cap.isOpened():
+        for _ in range(3):
+            ok, _ = cap.read()
+            if ok:
+                break
+
+    return cap if cap.isOpened() else None
+
+def grab_frame_ffmpeg(dev_path):
+    # Robust fallback: grab one MJPEG frame via ffmpeg and decode to ndarray
+    cmd = f"ffmpeg -hide_banner -loglevel error -f video4linux2 -input_format mjpeg -video_size 1280x720 -i {dev_path} -frames:v 1 -f mjpeg -"
+    p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6)
+    if p.returncode != 0 or not p.stdout:
+        return None
+    arr = np.frombuffer(p.stdout, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
 def ts_name() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -47,11 +82,31 @@ def ensure_csv_header(p: Path):
 
 # ---------- main ----------
 def main():
-    # Open camera
-    src = int(SRC) if SRC.isdigit() else SRC
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera source: {SRC}")
+    SRC = os.getenv("SV_CAM_SRC", "/dev/video1")
+    cap = open_camera_from_env()
+    if cap is None:
+        # Try ffmpeg once if a device path was provided
+        if not SRC.isdigit():
+            test = grab_frame_ffmpeg(SRC)
+            if test is None:
+                raise RuntimeError(f"Cannot open camera source: {SRC}")
+        else:
+            raise RuntimeError(f"Cannot open camera source: {SRC}")
+
+    # inside your while loop, replace the read:
+    frame = None
+    if cap is not None:
+        ok, frame = cap.read()
+    # Fallback if OpenCV drops a frame
+    if frame is None or not ok:
+        dev_path = SRC if not SRC.isdigit() else f"/dev/video{SRC}"
+        frame = grab_frame_ffmpeg(dev_path)
+
+    if frame is None:
+        print("[SeatView] WARN: failed to read frame; retrying next interval")
+        # sleep & continue
+        time.sleep(INTERVAL_SEC)
+        continue
 
     # Load model
     model = YOLO(str(YOLO_DIR / WEIGHTS))

@@ -2,7 +2,7 @@ from ultralytics import YOLO
 import cv2
 
 # COCO dataset pretrained wights
-model = YOLO("yolov8s.pt")  # or 'n' for nano
+model = YOLO("yolov8m.pt")  # or 'n' for nano
 
 # Classes to keep: person(0), backpack(24), chair(56), dining table(60)
 # (Optionally include handbag(26), suitcase(28) if useful)
