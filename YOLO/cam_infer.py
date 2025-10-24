@@ -1,34 +1,45 @@
 #!/usr/bin/env python3
-import os, time, csv, signal
-from datetime import datetime
+# cam_infer.py — SeatView: webcam → YOLO → CSV (+optional annotated JPG)
+# Works on Le Potato (CPU) with Logitech C920 @ /dev/video1
+
+import os, time, csv, signal, subprocess, shlex
 from pathlib import Path
+from datetime import datetime
 
 import cv2
-from ultralytics import YOLO
+import numpy as np
 import torch
-import subprocess, shlex, numpy as np
+from ultralytics import YOLO
 
-# ---------- config (env variables overrides) ----------
+# ----------------------- CONFIG (via env) -----------------------
 INTERVAL_SEC = int(os.getenv("SV_INTERVAL_SEC", "30"))
-SRC          = os.getenv("SV_CAM_SRC", "0")   # "0" for /dev/video0, or rtsp/http URL
-WEIGHTS      = os.getenv("SV_WEIGHTS", "yolov8m.pt")  # yolov8n.pt on Le Potato
-IMG_SIZE     = int(os.getenv("SV_IMG_SIZE", "640"))
+SRC_ENV      = os.getenv("SV_CAM_SRC", "/dev/video1")  # "1" or "/dev/video1"
+WEIGHTS      = os.getenv("SV_WEIGHTS", "yolov8n.pt")   # start small on CPU
+IMG_SIZE     = int(os.getenv("SV_IMG_SIZE", "512"))
 CONF         = float(os.getenv("SV_CONF", "0.35"))
 IOU          = float(os.getenv("SV_IOU", "0.5"))
-CLASSES      = [0, 24, 56, 60]  # person, backpack, chair, dining table
+SAVE_JPGS    = os.getenv("SV_SAVE_JPGS", "1") == "1"
 
-# Paths (from job_bashrc)
+# Classes: person(0), backpack(24), chair(56), dining table(60)
+CLASSES      = [0, 24, 56, 60]
+
+# Project paths (repo root assumed to be $HOME/SeatView)
 HOME      = Path(os.getenv("HOME", ".")).resolve()
-ROOT      = HOME
+ROOT      = HOME / "seatview" / "SeatView"
 YOLO_DIR  = ROOT / "YOLO"
 OUT_DIR   = YOLO_DIR / "runs" / "cam_preds"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 CSV_PATH  = OUT_DIR / "detections.csv"
-SAVE_JPGS = os.getenv("SV_SAVE_JPGS", "1") == "1"   # save annotated frames
 
+# Device selection
 DEVICE = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------- exit ----------
+# Camera capture settings (hint MJPEG @ 1280x720, low FPS to save CPU)
+CAP_WIDTH  = int(os.getenv("SV_CAP_WIDTH",  "1280"))
+CAP_HEIGHT = int(os.getenv("SV_CAP_HEIGHT", "720"))
+CAP_FPS    = int(os.getenv("SV_CAP_FPS",    "5"))
+
+# ----------------------- SIGNAL HANDLING ------------------------
 _running = True
 def _stop(*_):
     global _running
@@ -36,41 +47,7 @@ def _stop(*_):
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
-# ---------- helpers ----------
-
-def open_camera_from_env():
-    src_env = os.getenv("SV_CAM_SRC", "/dev/video1")  # default for your board
-    # Use CAP_V4L2 for numeric indices, CAP_ANY for device paths to avoid
-    # "backend can't be used to capture by name" warnings.
-    if src_env.isdigit():
-        cap = cv2.VideoCapture(int(src_env), cv2.CAP_V4L2)
-    else:
-        cap = cv2.VideoCapture(src_env, cv2.CAP_ANY)
-
-    # Hint the camera to MJPEG 1280x720 @ low FPS to save CPU
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 5)
-
-    # Warm-up reads (some cams need a couple)
-    if cap.isOpened():
-        for _ in range(3):
-            ok, _ = cap.read()
-            if ok:
-                break
-
-    return cap if cap.isOpened() else None
-
-def grab_frame_ffmpeg(dev_path):
-    # Robust fallback: grab one MJPEG frame via ffmpeg and decode to ndarray
-    cmd = f"ffmpeg -hide_banner -loglevel error -f video4linux2 -input_format mjpeg -video_size 1280x720 -i {dev_path} -frames:v 1 -f mjpeg -"
-    p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=6)
-    if p.returncode != 0 or not p.stdout:
-        return None
-    arr = np.frombuffer(p.stdout, dtype=np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
+# ----------------------- HELPERS --------------------------------
 def ts_name() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -80,92 +57,63 @@ def ensure_csv_header(p: Path):
             w = csv.writer(f)
             w.writerow(["timestamp","image","class","conf","x1","y1","x2","y2"])
 
-# ---------- main ----------
+def open_camera_from_env(src_env: str):
+    """
+    OpenCV open with correct backend:
+      - numeric index -> CAP_V4L2
+      - device path   -> CAP_ANY (avoid 'capture by name' warning)
+    Then hint MJPEG 1280x720 at CAP_FPS.
+    """
+    if src_env.isdigit():
+        cap = cv2.VideoCapture(int(src_env), cv2.CAP_V4L2)
+    else:
+        cap = cv2.VideoCapture(src_env, cv2.CAP_ANY)
+
+    # Hint MJPEG + size + fps (C920 handles MJPG in-hardware, saves CPU)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAP_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS,          CAP_FPS)
+
+    # Warmup reads (some cams need a couple frames)
+    if cap.isOpened():
+        for _ in range(3):
+            ok, _frame = cap.read()
+            if ok:
+                break
+    return cap if cap.isOpened() else None
+
+def grab_frame_ffmpeg(dev_path: str):
+    """
+    Robust fallback: pull one MJPEG frame with ffmpeg and decode to ndarray.
+    Avoids disk I/O; everything stays in-memory.
+    """
+    cmd = (
+        f"ffmpeg -hide_banner -loglevel error "
+        f"-f video4linux2 -input_format mjpeg -video_size {CAP_WIDTH}x{CAP_HEIGHT} "
+        f"-i {dev_path} -frames:v 1 -f mjpeg -"
+    )
+    p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+    if p.returncode != 0 or not p.stdout:
+        return None
+    arr = np.frombuffer(p.stdout, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
+
+def device_path_from_src(src_env: str) -> str:
+    return src_env if not src_env.isdigit() else f"/dev/video{src_env}"
+
+# ----------------------- MAIN -----------------------------------
 def main():
-    SRC = os.getenv("SV_CAM_SRC", "/dev/video1")
-    cap = open_camera_from_env()
-    if cap is None:
-        # Try ffmpeg once if a device path was provided
-        if not SRC.isdigit():
-            test = grab_frame_ffmpeg(SRC)
-            if test is None:
-                raise RuntimeError(f"Cannot open camera source: {SRC}")
-        else:
-            raise RuntimeError(f"Cannot open camera source: {SRC}")
-
-    # inside your while loop, replace the read:
-    frame = None
-    if cap is not None:
-        ok, frame = cap.read()
-    # Fallback if OpenCV drops a frame
-    if frame is None or not ok:
-        dev_path = SRC if not SRC.isdigit() else f"/dev/video{SRC}"
-        frame = grab_frame_ffmpeg(dev_path)
-
-    if frame is None:
-        print("[SeatView] WARN: failed to read frame; retrying next interval")
-        # sleep & continue
-        time.sleep(INTERVAL_SEC)
-        continue
+    # Ultralytics sometimes wants a writable config dir on SBCs
+    os.environ.setdefault("YOLO_CONFIG_DIR", str(HOME / ".config" / "Ultralytics"))
+    (HOME / ".config" / "Ultralytics").mkdir(parents=True, exist_ok=True)
 
     # Load model
-    model = YOLO(str(YOLO_DIR / WEIGHTS))
+    model_path = str((YOLO_DIR / WEIGHTS) if not Path(WEIGHTS).exists() else WEIGHTS)
+    model = YOLO(model_path)
+
+    # Outputs
     ensure_csv_header(CSV_PATH)
 
-    print(f"[SeatView] Starting cam loop (interval={INTERVAL_SEC}s, device={DEVICE})")
-    print(f"[SeatView] Writing to {OUT_DIR}")
-
-    while _running:
-        t0 = time.time()
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            print("[SeatView] WARN: failed to read frame; retrying next interval")
-        else:
-            stamp = ts_name()
-            # Run prediction in-memory
-            results = model.predict(
-                frame,
-                imgsz=IMG_SIZE,
-                conf=CONF,
-                iou=IOU,
-                classes=CLASSES,
-                device=DEVICE,
-                verbose=False
-            )
-            r = results[0]
-            names = r.names
-
-            # raw boxes + save annotated image for audit
-            img_name = f"{stamp}.jpg"
-            if SAVE_JPGS:
-                draw = frame.copy()
-                for b in r.boxes:
-                    cls = int(b.cls[0]); conf = float(b.conf[0])
-                    x1,y1,x2,y2 = map(int, b.xyxy[0])
-                    cv2.rectangle(draw, (x1,y1), (x2,y2), (0,255,0), 2)
-                    cv2.putText(draw, f"{names[cls]} {conf:.2f}", (x1, y1-6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
-                cv2.imwrite(str(OUT_DIR / img_name), draw)
-
-            # Append detections to CSV
-            with CSV_PATH.open("a", newline="") as f:
-                w = csv.writer(f)
-                for b in r.boxes:
-                    cls = int(b.cls[0]); conf = float(b.conf[0])
-                    x1,y1,x2,y2 = [float(v) for v in b.xyxy[0].tolist()]
-                    w.writerow([stamp, img_name if SAVE_JPGS else "", names[cls], f"{conf:.4f}",
-                                f"{x1:.1f}", f"{y1:.1f}", f"{x2:.1f}", f"{y2:.1f}"])
-
-            # You can trigger your existing chair_table_prox.py on the CSV or read it directly.
-            print(f"[SeatView] {stamp}: {len(r.boxes)} detections")
-
-        # sleep the remainder to maintain fixed cadence
-        elapsed = time.time() - t0
-        to_sleep = max(0.0, INTERVAL_SEC - elapsed)
-        time.sleep(to_sleep)
-
-    cap.release()
-    print("[SeatView] Stopped.")
-
-if __name__ == "__main__":
-    main()
+    # Open came
